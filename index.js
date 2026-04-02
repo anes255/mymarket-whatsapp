@@ -13,7 +13,6 @@ const PORT = process.env.PORT || 3001;
 const API_SECRET = process.env.API_SECRET || 'mymarket-wa-secret-2026';
 const AUTH_DIR = path.join(__dirname, 'wa-sessions');
 
-// ═══════ SESSION MANAGEMENT ═══════
 const sessions = {};
 
 function getStatus(storeId) {
@@ -31,17 +30,23 @@ function getStatus(storeId) {
 
 async function startSession(storeId) {
   if (sessions[storeId]?.sock) {
+    try { sessions[storeId].sock.ws.close(); } catch (e) {}
     try { sessions[storeId].sock.end(); } catch (e) {}
   }
 
   const sessionDir = path.join(AUTH_DIR, storeId);
+  // Clear old session to force fresh QR
+  if (!sessions[storeId]?.status || sessions[storeId]?.status !== 'connected') {
+    try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch (e) {}
+  }
   if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
 
   const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
 
+  console.log(`[${storeId}] Creating socket...`);
+
   const sock = makeWASocket({
     auth: state,
-    printQRInTerminal: true,
     browser: ['MyMarket', 'Chrome', '120.0'],
     connectTimeoutMs: 60000,
     defaultQueryTimeoutMs: 0,
@@ -49,20 +54,21 @@ async function startSession(storeId) {
     emitOwnEvents: false,
   });
 
-  sessions[storeId] = { sock, status: 'connecting', qr: null, phone: null, name: null, lastConnected: null };
+  sessions[storeId] = { sock, status: 'connecting', qr: null, phone: null, name: null, lastConnected: null, retryCount: 0 };
 
   sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
+    console.log(`[${storeId}] update: connection=${connection} hasQr=${!!qr} code=${lastDisconnect?.error?.output?.statusCode}`);
 
     if (qr) {
       try {
         const qrDataUrl = await QRCode.toDataURL(qr, { width: 300, margin: 2 });
         sessions[storeId].qr = qrDataUrl;
         sessions[storeId].status = 'waiting_qr';
-        console.log(`[${storeId}] QR code generated`);
-      } catch (e) { console.log('QR error:', e.message); }
+        console.log(`[${storeId}] QR READY (${qrDataUrl.length} bytes)`);
+      } catch (e) { console.log(`[${storeId}] QR gen error:`, e.message); }
     }
 
     if (connection === 'open') {
@@ -72,21 +78,26 @@ async function startSession(storeId) {
       sessions[storeId].phone = user?.id?.split(':')[0] || user?.id?.split('@')[0] || 'unknown';
       sessions[storeId].name = user?.name || '';
       sessions[storeId].lastConnected = new Date().toISOString();
-      console.log(`[${storeId}] ✅ Connected: ${sessions[storeId].phone}`);
+      sessions[storeId].retryCount = 0;
+      console.log(`[${storeId}] CONNECTED: ${sessions[storeId].phone}`);
     }
 
     if (connection === 'close') {
       const code = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = code !== DisconnectReason.loggedOut;
-      console.log(`[${storeId}] Disconnected: code=${code}, reconnect=${shouldReconnect}`);
+      const shouldReconnect = code !== DisconnectReason.loggedOut && code !== 403;
       sessions[storeId].status = 'disconnected';
-      sessions[storeId].qr = null;
 
-      if (shouldReconnect) {
-        setTimeout(() => startSession(storeId), 5000);
-      } else {
+      if (shouldReconnect && sessions[storeId].retryCount < 3) {
+        sessions[storeId].retryCount++;
+        const wait = 5000 * sessions[storeId].retryCount;
+        console.log(`[${storeId}] Reconnecting in ${wait/1000}s (try ${sessions[storeId].retryCount})`);
+        setTimeout(() => startSession(storeId), wait);
+      } else if (!shouldReconnect) {
         try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch (e) {}
         sessions[storeId].status = 'logged_out';
+        sessions[storeId].qr = null;
+      } else {
+        sessions[storeId].status = 'failed';
       }
     }
   });
@@ -99,55 +110,53 @@ async function sendMessage(storeId, phone, message) {
   if (!session || session.status !== 'connected') {
     return { success: false, reason: 'WhatsApp not connected. Scan QR code first.' };
   }
-
-  // Normalize Algerian phone
   let num = String(phone).replace(/[\s\-\+\(\)]/g, '');
   if (num.startsWith('00213')) num = num.substring(2);
   else if (num.startsWith('0')) num = '213' + num.substring(1);
   else if (!num.startsWith('213') && num.length <= 10) num = '213' + num;
-
   const jid = num + '@s.whatsapp.net';
-
   try {
-    await delay(2000); // Rate limit
+    await delay(2000);
     const result = await session.sock.sendMessage(jid, { text: message });
-    console.log(`[${storeId}] ✅ Sent to ${num}`);
+    console.log(`[${storeId}] SENT to ${num}`);
     return { success: true, messageId: result.key.id, to: num };
   } catch (e) {
-    console.error(`[${storeId}] ❌ Send error:`, e.message);
+    console.error(`[${storeId}] SEND ERROR:`, e.message);
     return { success: false, reason: e.message };
   }
 }
 
-// ═══════ AUTH MIDDLEWARE ═══════
 function auth(req, res, next) {
   const key = req.headers['x-api-secret'] || req.query.secret;
   if (key !== API_SECRET) return res.status(401).json({ error: 'Invalid API secret' });
   next();
 }
 
-// ═══════ ROUTES ═══════
-
-// Health check (no auth)
-app.get('/', (req, res) => res.json({ service: 'MyMarket WhatsApp', status: 'running', uptime: Math.floor(process.uptime()) + 's' }));
+app.get('/', (req, res) => res.json({ service: 'MyMarket WhatsApp', status: 'running', uptime: Math.floor(process.uptime()) + 's', sessions: Object.keys(sessions).length }));
 app.get('/health', (req, res) => res.json({ ok: true }));
 
-// Start session — generates QR
 app.post('/start', auth, async (req, res) => {
   try {
     const { storeId } = req.body;
     if (!storeId) return res.status(400).json({ error: 'storeId required' });
-    startSession(storeId).catch(e => console.log('Start error:', e.message));
-    res.json({ status: 'starting' });
+    console.log(`[${storeId}] START requested`);
+    await startSession(storeId);
+    // Wait up to 15 seconds for QR
+    for (let i = 0; i < 15; i++) {
+      await new Promise(r => setTimeout(r, 1000));
+      const s = getStatus(storeId);
+      if (s.qr) return res.json(s);
+      if (s.connected) return res.json(s);
+    }
+    res.json(getStatus(storeId));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Get status + QR
 app.get('/status/:storeId', auth, (req, res) => {
-  res.json(getStatus(req.params.storeId));
+  const s = getStatus(req.params.storeId);
+  res.json(s);
 });
 
-// Send message
 app.post('/send', auth, async (req, res) => {
   try {
     const { storeId, phone, message } = req.body;
@@ -158,13 +167,13 @@ app.post('/send', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Disconnect
 app.post('/disconnect', auth, async (req, res) => {
   try {
     const { storeId } = req.body;
     const session = sessions[storeId];
     if (session?.sock) {
-      try { await session.sock.logout(); session.sock.end(); } catch (e) {}
+      try { await session.sock.logout(); } catch (e) {}
+      try { session.sock.end(); } catch (e) {}
     }
     const sessionDir = path.join(AUTH_DIR, storeId);
     try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch (e) {}
@@ -173,21 +182,6 @@ app.post('/disconnect', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ═══════ RESTORE SESSIONS ON START ═══════
-async function restoreSessions() {
-  if (!fs.existsSync(AUTH_DIR)) { fs.mkdirSync(AUTH_DIR, { recursive: true }); return; }
-  const dirs = fs.readdirSync(AUTH_DIR);
-  for (const storeId of dirs) {
-    const sessionDir = path.join(AUTH_DIR, storeId);
-    if (fs.statSync(sessionDir).isDirectory()) {
-      console.log(`Restoring session: ${storeId}`);
-      try { await startSession(storeId); } catch (e) { console.log(`Restore failed ${storeId}:`, e.message); }
-    }
-  }
-}
-
-app.listen(PORT, async () => {
-  console.log(`🟢 WhatsApp service running on port ${PORT}`);
-  console.log(`🔑 API_SECRET: ${API_SECRET.substring(0, 10)}...`);
-  await restoreSessions();
+app.listen(PORT, () => {
+  console.log(`WhatsApp service on port ${PORT}`);
 });
