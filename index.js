@@ -29,6 +29,7 @@ function getStatus(storeId) {
 }
 
 async function startSession(storeId) {
+  // Kill old socket
   if (sessions[storeId]?.sock) {
     try { sessions[storeId].sock.ws.close(); } catch (e) {}
     try { sessions[storeId].sock.end(); } catch (e) {}
@@ -36,73 +37,63 @@ async function startSession(storeId) {
 
   const sessionDir = path.join(AUTH_DIR, storeId);
   // Clear old session to force fresh QR
-  if (!sessions[storeId]?.status || sessions[storeId]?.status !== 'connected') {
-    try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch (e) {}
-  }
-  if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
+  try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch (e) {}
+  fs.mkdirSync(sessionDir, { recursive: true });
 
   const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
 
-  console.log(`[${storeId}] Creating socket...`);
+  console.log(`[${storeId}] Creating socket (Baileys v6)...`);
 
   const sock = makeWASocket({
     auth: state,
-    browser: ['MyMarket', 'Chrome', '120.0'],
+    printQRInTerminal: true,
+    browser: ['MyMarket', 'Chrome', '4.0.0'],
     connectTimeoutMs: 60000,
-    defaultQueryTimeoutMs: 0,
-    keepAliveIntervalMs: 30000,
-    emitOwnEvents: false,
   });
 
-  sessions[storeId] = { sock, status: 'connecting', qr: null, phone: null, name: null, lastConnected: null, retryCount: 0 };
+  sessions[storeId] = { sock, status: 'connecting', qr: null, phone: null, name: null, lastConnected: null };
 
   sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
-    console.log(`[${storeId}] update: connection=${connection} hasQr=${!!qr} code=${lastDisconnect?.error?.output?.statusCode}`);
+    console.log(`[${storeId}] event: conn=${connection} qr=${!!qr} code=${lastDisconnect?.error?.output?.statusCode}`);
 
     if (qr) {
       try {
         const qrDataUrl = await QRCode.toDataURL(qr, { width: 300, margin: 2 });
         sessions[storeId].qr = qrDataUrl;
         sessions[storeId].status = 'waiting_qr';
-        console.log(`[${storeId}] QR READY (${qrDataUrl.length} bytes)`);
-      } catch (e) { console.log(`[${storeId}] QR gen error:`, e.message); }
+        console.log(`[${storeId}] ✅ QR READY`);
+      } catch (e) { console.log(`[${storeId}] QR error:`, e.message); }
     }
 
     if (connection === 'open') {
       const user = sock.user;
       sessions[storeId].status = 'connected';
       sessions[storeId].qr = null;
-      sessions[storeId].phone = user?.id?.split(':')[0] || user?.id?.split('@')[0] || 'unknown';
+      sessions[storeId].phone = user?.id?.split(':')[0] || user?.id?.split('@')[0] || '';
       sessions[storeId].name = user?.name || '';
       sessions[storeId].lastConnected = new Date().toISOString();
-      sessions[storeId].retryCount = 0;
-      console.log(`[${storeId}] CONNECTED: ${sessions[storeId].phone}`);
+      console.log(`[${storeId}] ✅ CONNECTED: +${sessions[storeId].phone}`);
     }
 
     if (connection === 'close') {
       const code = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = code !== DisconnectReason.loggedOut && code !== 403;
+      const shouldReconnect = code !== DisconnectReason.loggedOut;
+      console.log(`[${storeId}] CLOSED code=${code} reconnect=${shouldReconnect}`);
       sessions[storeId].status = 'disconnected';
 
-      if (shouldReconnect && sessions[storeId].retryCount < 3) {
-        sessions[storeId].retryCount++;
-        const wait = 5000 * sessions[storeId].retryCount;
-        console.log(`[${storeId}] Reconnecting in ${wait/1000}s (try ${sessions[storeId].retryCount})`);
-        setTimeout(() => startSession(storeId), wait);
-      } else if (!shouldReconnect) {
+      if (shouldReconnect) {
+        console.log(`[${storeId}] Reconnecting in 5s...`);
+        setTimeout(() => startSession(storeId), 5000);
+      } else {
         try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch (e) {}
         sessions[storeId].status = 'logged_out';
         sessions[storeId].qr = null;
-      } else {
-        sessions[storeId].status = 'failed';
       }
     }
   });
-
-  return sessions[storeId];
 }
 
 async function sendMessage(storeId, phone, message) {
@@ -118,10 +109,10 @@ async function sendMessage(storeId, phone, message) {
   try {
     await delay(2000);
     const result = await session.sock.sendMessage(jid, { text: message });
-    console.log(`[${storeId}] SENT to ${num}`);
+    console.log(`[${storeId}] ✅ SENT to ${num}`);
     return { success: true, messageId: result.key.id, to: num };
   } catch (e) {
-    console.error(`[${storeId}] SEND ERROR:`, e.message);
+    console.error(`[${storeId}] ❌ SEND ERROR:`, e.message);
     return { success: false, reason: e.message };
   }
 }
@@ -132,48 +123,42 @@ function auth(req, res, next) {
   next();
 }
 
-app.get('/', (req, res) => res.json({ service: 'MyMarket WhatsApp', status: 'running', uptime: Math.floor(process.uptime()) + 's', sessions: Object.keys(sessions).length }));
+app.get('/', (req, res) => res.json({ service: 'MyMarket WhatsApp', version: 'baileys-v6', uptime: Math.floor(process.uptime()) + 's' }));
 app.get('/health', (req, res) => res.json({ ok: true }));
 
 app.post('/start', auth, async (req, res) => {
   try {
     const { storeId } = req.body;
     if (!storeId) return res.status(400).json({ error: 'storeId required' });
-    console.log(`[${storeId}] START requested`);
+    console.log(`[${storeId}] START`);
     await startSession(storeId);
-    // Wait up to 15 seconds for QR
+    // Wait up to 15s for QR
     for (let i = 0; i < 15; i++) {
       await new Promise(r => setTimeout(r, 1000));
       const s = getStatus(storeId);
-      if (s.qr) return res.json(s);
-      if (s.connected) return res.json(s);
+      if (s.qr || s.connected) return res.json(s);
     }
     res.json(getStatus(storeId));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/status/:storeId', auth, (req, res) => {
-  const s = getStatus(req.params.storeId);
-  res.json(s);
-});
+app.get('/status/:storeId', auth, (req, res) => res.json(getStatus(req.params.storeId)));
 
 app.post('/send', auth, async (req, res) => {
   try {
     const { storeId, phone, message } = req.body;
     if (!storeId || !phone) return res.status(400).json({ error: 'storeId and phone required' });
     const result = await sendMessage(storeId, phone, message || 'Hello from your store!');
-    if (result.success) res.json(result);
-    else res.status(400).json(result);
+    if (result.success) res.json(result); else res.status(400).json(result);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/disconnect', auth, async (req, res) => {
   try {
     const { storeId } = req.body;
-    const session = sessions[storeId];
-    if (session?.sock) {
-      try { await session.sock.logout(); } catch (e) {}
-      try { session.sock.end(); } catch (e) {}
+    if (sessions[storeId]?.sock) {
+      try { await sessions[storeId].sock.logout(); } catch (e) {}
+      try { sessions[storeId].sock.end(); } catch (e) {}
     }
     const sessionDir = path.join(AUTH_DIR, storeId);
     try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch (e) {}
@@ -182,6 +167,4 @@ app.post('/disconnect', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.listen(PORT, () => {
-  console.log(`WhatsApp service on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`WhatsApp service (Baileys v6) on port ${PORT}`));
