@@ -1,3 +1,7 @@
+// ═══ CRITICAL: Polyfill crypto for Node 18 (Baileys needs Web Crypto as a global) ═══
+const { webcrypto } = require('crypto');
+if (!globalThis.crypto) globalThis.crypto = webcrypto;
+
 const express = require('express');
 const cors = require('cors');
 const {
@@ -13,8 +17,6 @@ const QRCode = require('qrcode');
 const pino = require('pino');
 const fs = require('fs');
 const path = require('path');
-const https = require('https');
-const { WebSocket } = require('ws');
 
 const app = express();
 app.use(cors());
@@ -26,8 +28,7 @@ const AUTH_DIR = path.join(__dirname, 'wa-sessions');
 
 if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
 
-// Set to 'warn' so we can see Baileys actual error messages
-const baileysLogger = pino({ level: 'warn' });
+const baileysLogger = pino({ level: process.env.LOG_LEVEL || 'silent' });
 
 const sessions = {};
 
@@ -72,7 +73,7 @@ async function startSession(storeId) {
   try {
     await createSocket(storeId, sessionDir);
   } catch (e) {
-    console.error(`[${storeId}] startSession CRASH:`, e);
+    console.error(`[${storeId}] startSession error:`, e.message);
     sessions[storeId].status = 'error';
     sessions[storeId].error = e.message;
   }
@@ -83,10 +84,10 @@ async function createSocket(storeId, sessionDir) {
   try {
     const vInfo = await fetchLatestBaileysVersion();
     version = vInfo.version;
-    console.log(`[${storeId}] WA version: ${version.join('.')} (latest=${vInfo.isLatest})`);
+    console.log(`[${storeId}] WA version: ${version.join('.')}`);
   } catch (e) {
-    console.log(`[${storeId}] fetchVersion failed: ${e.message}, using default`);
-    version = [2, 3000, 1015901307]; // fallback
+    console.log(`[${storeId}] fetchVersion failed, using default`);
+    version = [2, 3000, 1015901307];
   }
 
   const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
@@ -96,7 +97,6 @@ async function createSocket(storeId, sessionDir) {
     version,
     logger: baileysLogger,
     printQRInTerminal: true,
-    // Use Baileys built-in browser identity
     browser: Browsers.ubuntu('Chrome'),
     auth: {
       creds: state.creds,
@@ -107,8 +107,6 @@ async function createSocket(storeId, sessionDir) {
     keepAliveIntervalMs: 30000,
     emitOwnEvents: false,
     generateHighQualityLinkPreview: false,
-    // These options help with connection stability
-    retryRequestDelayMs: 2000,
     syncFullHistory: false,
     markOnlineOnConnect: false,
   });
@@ -120,21 +118,8 @@ async function createSocket(storeId, sessionDir) {
     const { connection, lastDisconnect, qr } = update;
     const code = lastDisconnect?.error?.output?.statusCode;
     const errorMsg = lastDisconnect?.error?.message || '';
-    const errorData = lastDisconnect?.error?.data || lastDisconnect?.error?.output?.payload || '';
 
-    // Full error logging
-    console.log(`[${storeId}] conn.update → connection=${connection || '-'} qr=${!!qr} code=${code || '-'} error="${errorMsg}" data=${JSON.stringify(errorData)}`);
-
-    if (lastDisconnect?.error) {
-      console.log(`[${storeId}] FULL ERROR:`, JSON.stringify({
-        message: lastDisconnect.error.message,
-        statusCode: lastDisconnect.error.output?.statusCode,
-        payload: lastDisconnect.error.output?.payload,
-        data: lastDisconnect.error.data,
-        isBoom: lastDisconnect.error.isBoom,
-        stack: (lastDisconnect.error.stack || '').split('\n').slice(0, 3).join(' | '),
-      }));
-    }
+    console.log(`[${storeId}] conn=${connection || '-'} qr=${!!qr} code=${code || '-'} err="${errorMsg}"`);
 
     if (qr) {
       try {
@@ -166,7 +151,7 @@ async function createSocket(storeId, sessionDir) {
       const retries = (sessions[storeId].retries || 0) + 1;
       sessions[storeId].retries = retries;
 
-      console.log(`[${storeId}] ❌ CLOSED code=${code} err="${errorMsg}" reconnect=${shouldReconnect} retry=${retries}/5`);
+      console.log(`[${storeId}] ❌ CLOSED code=${code} err="${errorMsg}" retry=${retries}/5`);
 
       if (!shouldReconnect) {
         try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch (e) {}
@@ -178,7 +163,7 @@ async function createSocket(storeId, sessionDir) {
 
       if (retries > 5) {
         sessions[storeId].status = 'error';
-        sessions[storeId].error = `Failed after ${retries} attempts: ${errorMsg || 'unknown error'}`;
+        sessions[storeId].error = `Failed after ${retries} attempts: ${errorMsg || 'unknown'}`;
         sessions[storeId].qr = null;
         sessions[storeId].sock = null;
         return;
@@ -190,10 +175,7 @@ async function createSocket(storeId, sessionDir) {
       sessions[storeId].qr = null;
 
       setTimeout(async () => {
-        try {
-          await createSocket(storeId, sessionDir);
-        } catch (e) {
-          console.error(`[${storeId}] reconnect error:`, e);
+        try { await createSocket(storeId, sessionDir); } catch (e) {
           sessions[storeId].status = 'error';
           sessions[storeId].error = e.message;
         }
@@ -215,8 +197,10 @@ async function sendMessage(storeId, phone, message) {
   try {
     await delay(2000);
     const result = await session.sock.sendMessage(jid, { text: message });
+    console.log(`[${storeId}] ✅ SENT to ${num}`);
     return { success: true, messageId: result.key.id, to: num };
   } catch (e) {
+    console.error(`[${storeId}] ❌ SEND ERROR:`, e.message);
     return { success: false, reason: e.message };
   }
 }
@@ -229,83 +213,19 @@ function auth(req, res, next) {
 
 // ═══ ROUTES ═══
 app.get('/', (req, res) => res.json({
-  service: 'MyMarket WhatsApp', version: 'baileys-v9-debug',
+  service: 'MyMarket WhatsApp', version: 'baileys-v10',
   uptime: Math.floor(process.uptime()) + 's',
   node: process.version,
-  platform: process.platform,
-  arch: process.arch,
+  cryptoPolyfilled: true,
 }));
 
 app.get('/health', (req, res) => res.json({ ok: true, uptime: Math.floor(process.uptime()) }));
-
-// ═══ CONNECTIVITY TEST — tests if Railway can reach WhatsApp servers ═══
-app.get('/test-connectivity', auth, async (req, res) => {
-  const results = {};
-
-  // Test 1: DNS resolution
-  try {
-    const dns = require('dns').promises;
-    const addrs = await dns.resolve4('web.whatsapp.com');
-    results.dns = { ok: true, addresses: addrs };
-  } catch (e) {
-    results.dns = { ok: false, error: e.message };
-  }
-
-  // Test 2: HTTPS to WhatsApp web
-  try {
-    const resp = await fetch('https://web.whatsapp.com/check-update?version=0&platform=web');
-    const text = await resp.text();
-    results.https = { ok: resp.ok, status: resp.status, body: text.substring(0, 200) };
-  } catch (e) {
-    results.https = { ok: false, error: e.message };
-  }
-
-  // Test 3: WebSocket to WhatsApp
-  try {
-    const wsResult = await new Promise((resolve) => {
-      const ws = new WebSocket('wss://web.whatsapp.com/ws/chat', {
-        headers: { Origin: 'https://web.whatsapp.com' },
-        timeout: 10000,
-      });
-      const timer = setTimeout(() => {
-        ws.close();
-        resolve({ ok: false, error: 'timeout after 10s' });
-      }, 10000);
-      ws.on('open', () => {
-        clearTimeout(timer);
-        ws.close();
-        resolve({ ok: true, message: 'WebSocket connected successfully' });
-      });
-      ws.on('error', (e) => {
-        clearTimeout(timer);
-        resolve({ ok: false, error: e.message });
-      });
-    });
-    results.websocket = wsResult;
-  } catch (e) {
-    results.websocket = { ok: false, error: e.message };
-  }
-
-  // Test 4: Baileys version check
-  try {
-    const { version, isLatest } = await fetchLatestBaileysVersion();
-    results.baileys_version = { ok: true, version: version.join('.'), isLatest };
-  } catch (e) {
-    results.baileys_version = { ok: false, error: e.message };
-  }
-
-  results.node_version = process.version;
-  results.platform = process.platform;
-
-  res.json(results);
-});
 
 app.post('/start', auth, async (req, res) => {
   try {
     const { storeId } = req.body;
     if (!storeId) return res.status(400).json({ error: 'storeId required' });
-    console.log(`[${storeId}] ▶ START requested`);
-
+    console.log(`[${storeId}] ▶ START`);
     startSession(storeId);
 
     for (let i = 0; i < 16; i++) {
@@ -314,9 +234,7 @@ app.post('/start', auth, async (req, res) => {
       if (s.qr || s.connected || s.status === 'error') return res.json(s);
     }
     res.json(getStatus(storeId));
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/status/:storeId', auth, (req, res) => res.json(getStatus(req.params.storeId)));
@@ -353,7 +271,5 @@ app.get('/sessions', auth, (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`✅ WhatsApp service (v9-debug) on port ${PORT}`);
-  console.log(`   Node: ${process.version}`);
-  console.log(`   Platform: ${process.platform} ${process.arch}`);
+  console.log(`✅ WhatsApp service (v10) on port ${PORT} | Node ${process.version} | crypto: ${typeof globalThis.crypto}`);
 });
